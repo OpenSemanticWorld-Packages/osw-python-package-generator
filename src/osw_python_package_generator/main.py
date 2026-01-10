@@ -12,7 +12,7 @@ from osw.wtsite import WtPage, WtSite
 
 _logger = logging.getLogger(__name__)
 
-script_version = "0.1.0"
+script_version = "0.1.1"
 
 python_code_filename = "_model.py"
 
@@ -134,7 +134,10 @@ def generate_python_dataclasses(
             offline_pages=schema_pages,
             result_model_path=python_code_path,
             mode="replace",
-            generator_options={"output_model_type": "pydantic_v2.BaseModel"},
+            generator_options={
+                "output_model_type": "pydantic_v2.BaseModel",
+                "disable_timestamp": True,
+            },
         )
     )
 
@@ -151,7 +154,10 @@ def generate_python_dataclasses(
             offline_pages=schema_pages,
             result_model_path=python_code_path_v1,
             mode="replace",
-            generator_options={"output_model_type": "pydantic.BaseModel"},
+            generator_options={
+                "output_model_type": "pydantic.BaseModel",
+                "disable_timestamp": True,
+            },
         )
     )
 
