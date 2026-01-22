@@ -8,7 +8,16 @@ if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO)
 
     build_packages(
-        packages=["world.opensemantic.core@v0.53.2"],
+        # specific version
+        # packages=["world.opensemantic.core@v0.53.2"],
+        # latest version
+        # packages=["world.opensemantic.core"],
+        # multiple packages
+        packages=[
+            "world.opensemantic.core",
+            "world.opensemantic.base",
+            "world.opensemantic.lab",
+        ],
         python_code_working_dir_root=Path(__file__).parents[3] / "python_packages",
         commit=False,
     )

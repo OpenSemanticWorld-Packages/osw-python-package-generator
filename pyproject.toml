@@ -5,12 +5,13 @@ description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
+    "autoflake>=2.3.1",
     "gitpython>=3.1.46",
     "osw",
 ]
 
 [tool.uv.sources]
-osw = { git = "https://github.com/OpenSemanticLab/osw-python", rev = "v1.0.0" }
+osw = { git = "https://github.com/OpenSemanticLab/osw-python" }
 
 [build-system]
 requires = ["hatchling"]

@@ -1,10 +1,15 @@
+import json
 import logging
 import os
+import re
 import tempfile
 import urllib.request
 import zipfile
 from pathlib import Path
 
+import autoflake
+import black
+import isort
 from git import InvalidGitRepositoryError
 from osw.auth import CredentialManager
 from osw.core import OSW
@@ -12,7 +17,7 @@ from osw.wtsite import WtPage, WtSite
 
 _logger = logging.getLogger(__name__)
 
-script_version = "0.1.1"
+script_version = "0.2.0"
 
 python_code_filename = "_model.py"
 
@@ -32,11 +37,33 @@ osw_obj = OSW(
 )
 
 
+def get_lastest_version(package_name):
+    # determine latest tag
+    git_url = "https://github.com/OpenSemanticWorld-Packages/" + package_name
+    # e.g. https://api.github.com/repos/OpenSemanticWorld-Packages/world.opensemantic.core/tags
+    package_versions_url = (
+        git_url.replace("github.com", "api.github.com/repos") + "/tags"
+    )
+    # fetch JSON document with request lib
+    with urllib.request.urlopen(package_versions_url) as response:
+        tags = json.load(response)
+        if tags:
+            package_version = tags[0]["name"]
+            return package_version
+    return None
+
+
 def download_schema_package(
-    package_name, package_version
+    package_name, package_version=None
 ) -> WtSite.ReadPagePackageResult:
     # define repo url, e.g. https://github.com/OpenSemanticWorld-Packages/world.opensemantic.core
     git_url = "https://github.com/OpenSemanticWorld-Packages/" + package_name
+
+    if package_version is None:
+        package_version = get_lastest_version(package_name)
+
+    _logger.info(f"Downloading schema package {package_name} version {package_version}")
+
     git_zip_url = git_url + "/archive/refs/tags/" + package_version + ".zip"
     # download package as zip
     # using a temp dir
@@ -113,6 +140,7 @@ def commit_and_tag(directory, file_paths, commit_message, tag_name):
 
 def generate_python_dataclasses(
     schema_pages: dict[str, WtPage],
+    offline_pages: dict[str, WtPage],
     python_code_working_dir: Path,
     python_code_filename: Path,
 ) -> list[Path]:
@@ -127,11 +155,14 @@ def generate_python_dataclasses(
     # make sure code paths exist
     python_code_path.parent.mkdir(parents=True, exist_ok=True)
     python_code_path_v1.parent.mkdir(parents=True, exist_ok=True)
+    # create empty files if the do not exists
+    python_code_path.touch(exist_ok=True)
+    python_code_path_v1.touch(exist_ok=True)
 
     res = osw_obj.fetch_schema(
         fetchSchemaParam=OSW.FetchSchemaParam(
             schema_title=schema_titles,
-            offline_pages=schema_pages,
+            offline_pages=offline_pages,
             result_model_path=python_code_path,
             mode="replace",
             generator_options={
@@ -151,7 +182,7 @@ def generate_python_dataclasses(
     res = osw_obj.fetch_schema(
         fetchSchemaParam=OSW.FetchSchemaParam(
             schema_title=schema_titles,
-            offline_pages=schema_pages,
+            offline_pages=offline_pages,
             result_model_path=python_code_path_v1,
             mode="replace",
             generator_options={
@@ -162,10 +193,10 @@ def generate_python_dataclasses(
     )
 
     # check if all fetched schemas are in the offline pages
-    if set(res.fetched_schema_titles) - set(schema_pages.keys()):
+    if set(res.fetched_schema_titles) - set(offline_pages.keys()):
         _logger.warning(
             f"Not all fetched schemas are in the offline pages: "
-            f"{set(res.fetched_schema_titles) - set(schema_pages.keys())}"
+            f"{set(res.fetched_schema_titles) - set(offline_pages.keys())}"
         )
     if res.warning_messages:
         for warning_message in res.warning_messages:
@@ -177,11 +208,123 @@ def generate_python_dataclasses(
     return [python_code_path, python_code_path_v1]
 
 
+def replace_duplicated_classes_with_imports(  # noqa: C901
+    package_index,
+    package_name,
+    python_code_working_dir_root,
+    python_code_working_dir,
+    python_code_filename,
+):
+    for subpath in ["", "v1"]:
+        imports: dict[str, str] = {}
+        for dep in package_index:
+            dep_python_package_name = dep.replace("world.", "") + "-python"
+            if dep != package_name:
+                # open the result _model.py file
+                dep_python_code_working_dir = (
+                    python_code_working_dir_root / dep_python_package_name / "src"
+                )
+                for component in dep_python_package_name.replace("-python", "").split(
+                    "."
+                ):
+                    dep_python_code_working_dir /= component
+                if subpath != "":
+                    dep_python_code_working_dir /= subpath
+                with open(
+                    dep_python_code_working_dir / python_code_filename
+                ) as dep_file:
+                    dep_code = dep_file.read()
+                    pattern = re.compile(
+                        r"^class\s*([\S]*)\s*\(\s*[\S\s]*?\s*\)\s*:.*\n", re.MULTILINE
+                    )  # match class definition [\s\S]*(?:[^\S\n]*\n){2,}
+                    classes = re.findall(pattern, dep_code)
+                _logger.info(f"Imported classes from {dep}: {classes}")
+
+                imports[dep_python_package_name.replace("-python", "")] = classes
+
+        _python_code_working_dir = python_code_working_dir
+        if subpath != "":
+            _python_code_working_dir /= subpath
+
+        with open(_python_code_working_dir / python_code_filename) as file:
+            content = file.read()
+        for dep_python_package_name, classes in imports.items():
+            import_stms = []
+            import_path = dep_python_package_name
+            if subpath != "":
+                import_path += "." + subpath
+            for c in classes:
+                content_size = len(content)
+                content = re.sub(
+                    r"^(class\s*"
+                    + c
+                    + r"\s*\(\s*[\S\s]*?\s*\)\s*:.*\n[\s\S]*?(?:[^\S\n]*\n){3,})",
+                    "",
+                    content,
+                    count=1,
+                    flags=re.MULTILINE,
+                )  # replace duplicated classes
+                if len(content) < content_size:
+                    # add import if class was removed
+                    import_stms.append(f"from {import_path} import {c}")
+
+                # remove also any
+                # <class>.update_forward_refs()
+                # or
+                # <class>.model_rebuild()
+                content = re.sub(
+                    "^" + c + re.escape(".update_forward_refs()") + "\n",
+                    "",
+                    content,
+                    count=1,
+                    flags=re.MULTILINE,
+                )
+                content = re.sub(
+                    "^" + c + re.escape(".model_rebuild()") + "\n",
+                    "",
+                    content,
+                    count=1,
+                    flags=re.MULTILINE,
+                )
+
+            content = "\n".join(import_stms) + "\n" + content
+
+        # hot replacements
+        hotfix_replacements = {
+            # remain error in datamodel-codegen - unresolved titles
+            # in Association and other OUs
+            r"([l|L]ist)\[OSW44deaa5b806d41a2a88594f562b110e9\]": r"\1[Person]",
+            # in Sampling
+            r"([l|L]ist)\[OSW3d238d05316e45a4ac95a11d7b24e36b\]": r"\1[Location]",
+            r": OSW3d238d05316e45a4ac95a11d7b24e36b": r": Location",
+            r"([l|L]ist)\[OSWe427aafafbac4262955b9f690a83405d\]": r"\1[Tool]",
+        }
+        for key, value in hotfix_replacements.items():
+            content = re.sub(key, value, content)
+
+        # run formatting tool black on the combined content
+        # consolidate imports as well
+        try:
+            content = black.format_str(content, mode=black.Mode())
+            # run isort to sort imports using Vertical Hanging Indent style
+            content = isort.code(content, profile="black")
+
+            content = autoflake.fix_code(content, remove_all_unused_imports=True)
+        except Exception as e:
+            _logger.error(f"Formatting failed: {e}")
+
+        with open(_python_code_working_dir / python_code_filename, "w") as file:
+            file.write(content)
+
+
 def build_packages(
     packages: list[str], python_code_working_dir_root: Path, commit: bool = False
 ):
     for package in packages:
-        package_name, package_version = package.split("@")
+        package_name = package.split("@")[0]
+        package_version = package.split("@")[1] if "@" in package else None
+        if package_version is None:
+            package_version = get_lastest_version(package_name)
 
         # define python repo url,
         # e.g. https://github.com/OpenSemanticWorld-Packages/opensemantic.core-python
@@ -199,30 +342,66 @@ def build_packages(
         # package version + post + builder script version
         # as int (the digits per version component)
         # e.g. package_version = 0.53.0, script_version = 0.1.0
-        # => 0.53.0.post000001000
-        # additional 3 digits for the build number
+        # => 0.53.0.post000100
+        # additional 1 digit for the build number
         # in case different runs could lead to different results
         run_number = 0
         python_version_number = (
             package_version
             + ".post"
-            + script_version.split(".")[0].zfill(3)
-            + script_version.split(".")[1].zfill(3)
-            + script_version.split(".")[2].zfill(3)
-            + str(run_number).zfill(3)
+            + script_version.split(".")[0].zfill(2)
+            + script_version.split(".")[1].zfill(2)
+            + script_version.split(".")[2].zfill(2)
+            + str(run_number)
         )
+        # pypi allows max len .post0000000
+        if len(python_version_number.split(".post")[1]) > 7:
+            raise ValueError(
+                f".post index of {python_version_number} string "
+                "too long for PyPI (max 7 digits)"
+            )
 
         _logger.info(
-            f"Building package {python_package_name} version {python_version_number}",
-            f"at {python_code_working_dir}",
+            f"Building package {python_package_name} version {python_version_number}"
+            f"at {python_code_working_dir}"
         )
 
+        package_index: dict[str, dict[str, WtPage]] = {}
         result = download_schema_package(package_name, package_version)
+        p_key = result.package_bundle.packages.keys().__iter__().__next__()
+        dependencies = result.package_bundle.packages[p_key].requiredPackages
+        while len(dependencies) > 0:
+            dep = dependencies.pop()
+            if dep not in package_index:
+                dep_result = download_schema_package(dep)
+                package_index[dep] = {page.title: page for page in dep_result.pages}
+                dep_p_key = (
+                    dep_result.package_bundle.packages.keys().__iter__().__next__()
+                )
+                dependencies.extend(
+                    dep_result.package_bundle.packages[dep_p_key].requiredPackages
+                )
 
+        # collect all pages from all packages in the index
         pages = {page.title: page for page in result.pages}
+        offline_pages = {
+            page.title: page
+            for pages in package_index.values()
+            for page in pages.values()
+        }
+        # add pages to offline pages
+        offline_pages.update(pages)
 
         python_code_paths = generate_python_dataclasses(
-            pages, python_code_working_dir, python_code_filename
+            pages, offline_pages, python_code_working_dir, python_code_filename
+        )
+
+        replace_duplicated_classes_with_imports(
+            package_index,
+            package_name,
+            python_code_working_dir_root,
+            python_code_working_dir,
+            python_code_filename,
         )
 
         # if the target dir is a git repo, tag it with the python package version
@@ -240,3 +419,21 @@ def build_packages(
                 )
         else:
             _logger.info(f"Done. Skipping commit and tag for {python_package_name}")
+
+
+if __name__ == "__main__":
+    # set log level info
+    logging.basicConfig(level=logging.INFO)
+
+    build_packages(
+        # packages=["world.opensemantic.core@v0.53.2"],
+        # packages=["world.opensemantic.base"],
+        # packages=["world.opensemantic.lab"],
+        packages=[
+            # "world.opensemantic.core",
+            "world.opensemantic.base",
+            # "world.opensemantic.lab",
+        ],
+        python_code_working_dir_root=Path(__file__).parents[4] / "python_packages",
+        commit=False,
+    )
