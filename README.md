@@ -19,11 +19,12 @@ This ensures you can always see which schema release the generated models were b
 The final Python package version is constructed as:
 
 ```text
-.post
+.post1AAAABBBCCCRRR
 ```
 
 where each component is zero-padded to 3 digits:
 
+- `1` – static leading `1` to prevent truncation of leading zeros by pypi
 - `AAA` – generator script **major** version
 - `BBB` – generator script **minor** version
 - `CCC` – generator script **patch** version
@@ -43,8 +44,11 @@ Example:
 Resulting Python package version:
 
 ```text
-0.53.0.post000001001000
+0.53.0.post1000001001000
 ```
+
+Note: pypi truncates the version number by removing leading zeros,
+therefore we add a leading `1`.
 
 This is PEP 440–compatible (`.post`) and encodes:
 

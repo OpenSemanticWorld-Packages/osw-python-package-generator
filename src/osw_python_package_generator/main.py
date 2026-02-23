@@ -17,7 +17,7 @@ from osw.wtsite import WtPage, WtSite
 
 _logger = logging.getLogger(__name__)
 
-script_version = "0.2.0"
+script_version = "0.2.1"
 
 python_code_filename = "_model.py"
 
@@ -342,24 +342,19 @@ def build_packages(
         # package version + post + builder script version
         # as int (the digits per version component)
         # e.g. package_version = 0.53.0, script_version = 0.1.0
-        # => 0.53.0.post000100
-        # additional 1 digit for the build number
+        # => 0.53.0.post000001000
+        # additional 3 digits for the build number
         # in case different runs could lead to different results
+        # note: pypi truncates the post number by removing leading zeros
         run_number = 0
         python_version_number = (
             package_version
-            + ".post"
-            + script_version.split(".")[0].zfill(2)
-            + script_version.split(".")[1].zfill(2)
-            + script_version.split(".")[2].zfill(2)
-            + str(run_number)
+            + ".post1"
+            + script_version.split(".")[0].zfill(3)
+            + script_version.split(".")[1].zfill(3)
+            + script_version.split(".")[2].zfill(3)
+            + str(run_number).zfill(3)
         )
-        # pypi allows max len .post0000000
-        if len(python_version_number.split(".post")[1]) > 7:
-            raise ValueError(
-                f".post index of {python_version_number} string "
-                "too long for PyPI (max 7 digits)"
-            )
 
         _logger.info(
             f"Building package {python_package_name} version {python_version_number}"
