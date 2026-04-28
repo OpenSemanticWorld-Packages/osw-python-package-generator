@@ -17,7 +17,7 @@ from osw.wtsite import WtPage, WtSite
 
 _logger = logging.getLogger(__name__)
 
-script_version = "0.2.1"
+script_version = "0.2.2"
 
 python_code_filename = "_model.py"
 
@@ -231,7 +231,8 @@ def replace_duplicated_classes_with_imports(  # noqa: C901
                 if subpath != "":
                     dep_python_code_working_dir /= subpath
                 with open(
-                    dep_python_code_working_dir / python_code_filename
+                    dep_python_code_working_dir / python_code_filename,
+                    encoding="utf-8",
                 ) as dep_file:
                     dep_code = dep_file.read()
                     pattern = re.compile(
@@ -246,7 +247,9 @@ def replace_duplicated_classes_with_imports(  # noqa: C901
         if subpath != "":
             _python_code_working_dir /= subpath
 
-        with open(_python_code_working_dir / python_code_filename) as file:
+        with open(
+            _python_code_working_dir / python_code_filename, encoding="utf-8"
+        ) as file:
             content = file.read()
         for dep_python_package_name, classes in imports.items():
             import_stms = []
@@ -302,6 +305,45 @@ def replace_duplicated_classes_with_imports(  # noqa: C901
         for key, value in hotfix_replacements.items():
             content = re.sub(key, value, content)
 
+        # deduplicate identical classes within the same file
+        # e.g. Tool and Tool1 generated from the same schema via different $ref paths
+        class_pattern = re.compile(
+            r"^(class\s+(\w+)\s*\([^)]*\)\s*:.*\n(?:(?!^class\s).*\n)*)",
+            re.MULTILINE,
+        )
+        class_bodies = {}  # name -> (full_match, body_without_classname)
+        for m in class_pattern.finditer(content):
+            full_match = m.group(1)
+            class_name = m.group(2)
+            # Normalize: replace the class name in the definition to compare bodies
+            body = re.sub(
+                r"^class\s+" + re.escape(class_name) + r"(\s*\()",
+                r"class __PLACEHOLDER__\1",
+                full_match,
+                count=1,
+            )
+            class_bodies[class_name] = (full_match, body)
+
+        for class_name, (full_match, body) in list(class_bodies.items()):
+            # Check if this is a numbered variant (e.g. Tool1, IDAndCountry1)
+            m = re.match(r"^(.+?)(\d+)$", class_name)
+            if m:
+                base_name = m.group(1)
+                if base_name in class_bodies:
+                    _, base_body = class_bodies[base_name]
+                    if body == base_body:
+                        _logger.info(
+                            f"Removing duplicate class {class_name} "
+                            f"(identical to {base_name})"
+                        )
+                        content = content.replace(full_match, "")
+                        # Replace any references to the numbered class
+                        content = re.sub(
+                            r"\b" + re.escape(class_name) + r"\b",
+                            base_name,
+                            content,
+                        )
+
         # run formatting tool black on the combined content
         # consolidate imports as well
         try:
@@ -313,7 +355,9 @@ def replace_duplicated_classes_with_imports(  # noqa: C901
         except Exception as e:
             _logger.error(f"Formatting failed: {e}")
 
-        with open(_python_code_working_dir / python_code_filename, "w") as file:
+        with open(
+            _python_code_working_dir / python_code_filename, "w", encoding="utf-8"
+        ) as file:
             file.write(content)
 
 
