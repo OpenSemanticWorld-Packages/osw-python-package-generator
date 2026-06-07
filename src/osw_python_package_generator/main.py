@@ -3,6 +3,7 @@ import logging
 import os
 import re
 import tempfile
+import urllib.error
 import urllib.request
 import zipfile
 from pathlib import Path
@@ -17,7 +18,7 @@ from osw.wtsite import WtPage, WtSite
 
 _logger = logging.getLogger(__name__)
 
-script_version = "0.2.2"
+script_version = "0.2.3"
 
 python_code_filename = "_model.py"
 
@@ -36,31 +37,90 @@ osw_obj = OSW(
     )
 )
 
+default_repo_org = "OpenSemanticWorld-Packages"
 
-def get_lastest_version(package_name):
+# packages in other GitHub orgs (e.g. upstream dependencies)
+repo_org_overrides = {}
+
+# prefixes to strip when deriving python package name from schema package name
+# e.g. "world.opensemantic.core" -> "opensemantic.core-python"
+# packages not matching any prefix keep their full name
+python_package_prefix_strip = [
+    "world.",
+]
+
+
+def _get_repo_org(package_name: str) -> str:
+    """Resolve the GitHub org for a package name."""
+    for prefix, org in repo_org_overrides.items():
+        if package_name.startswith(prefix):
+            return org
+    return default_repo_org
+
+
+def _get_python_package_name(package_name: str) -> str:
+    """Derive python package name from schema package name.
+
+    E.g. "world.opensemantic.core" -> "opensemantic.core-python"
+    """
+    for prefix in python_package_prefix_strip:
+        if package_name.startswith(prefix):
+            return package_name[len(prefix) :] + "-python"
+    return package_name + "-python"
+
+
+def _build_request(url: str, github_token: str | None = None) -> urllib.request.Request:
+    """Build a urllib Request, adding Authorization header if token is provided."""
+    req = urllib.request.Request(url)
+    if github_token:
+        # fine-grained tokens (github_pat_) use Bearer, classic PATs (ghp_) use token
+        auth_scheme = "Bearer" if github_token.startswith("github_pat_") else "token"
+        req.add_header("Authorization", f"{auth_scheme} {github_token}")
+        _logger.debug(
+            f"Request: {url} with {auth_scheme} auth "
+            f"(token prefix: {github_token[:10]}...)"
+        )
+    req.add_header("Accept", "application/vnd.github+json")
+    return req
+
+
+def get_lastest_version(package_name, github_token: str | None = None):
     # determine latest tag
-    git_url = "https://github.com/OpenSemanticWorld-Packages/" + package_name
+    git_url = "https://github.com/" + _get_repo_org(package_name) + "/" + package_name
     # e.g. https://api.github.com/repos/OpenSemanticWorld-Packages/world.opensemantic.core/tags
     package_versions_url = (
         git_url.replace("github.com", "api.github.com/repos") + "/tags"
     )
     # fetch JSON document with request lib
-    with urllib.request.urlopen(package_versions_url) as response:
-        tags = json.load(response)
-        if tags:
-            package_version = tags[0]["name"]
-            return package_version
+    req = _build_request(package_versions_url, github_token)
+    try:
+        with urllib.request.urlopen(req) as response:
+            tags = json.load(response)
+            if tags:
+                package_version = tags[0]["name"]
+                return package_version
+    except urllib.error.HTTPError as e:
+        _logger.error(
+            f"HTTP {e.code} fetching {package_versions_url}: {e.read().decode()}"
+        )
+        raise
     return None
 
 
 def download_schema_package(
-    package_name, package_version=None
+    package_name, package_version=None, github_token: str | None = None
 ) -> WtSite.ReadPagePackageResult:
     # define repo url, e.g. https://github.com/OpenSemanticWorld-Packages/world.opensemantic.core
-    git_url = "https://github.com/OpenSemanticWorld-Packages/" + package_name
+    git_url = "https://github.com/" + _get_repo_org(package_name) + "/" + package_name
 
     if package_version is None:
-        package_version = get_lastest_version(package_name)
+        package_version = get_lastest_version(package_name, github_token)
+
+    if package_version is None:
+        raise ValueError(
+            f"No tags found for package {package_name} "
+            f"in {_get_repo_org(package_name)} - cannot determine version"
+        )
 
     _logger.info(f"Downloading schema package {package_name} version {package_version}")
 
@@ -75,7 +135,9 @@ def download_schema_package(
             raise ValueError("URL must start with 'http:' or 'https:'")
 
         # Download the ZIP file
-        urllib.request.urlretrieve(git_zip_url, zip_path)  # nosec S310, url validated
+        req = _build_request(git_zip_url, github_token)
+        with urllib.request.urlopen(req) as response, open(zip_path, "wb") as f:  # nosec S310, url validated
+            f.write(response.read())
 
         # Extract the ZIP file
         with zipfile.ZipFile(zip_path, "r") as zip_ref:
@@ -208,22 +270,41 @@ def generate_python_dataclasses(
     return [python_code_path, python_code_path_v1]
 
 
+def _find_dep_python_root(
+    dep_python_package_name: str,
+    python_code_working_dir_root: Path,
+    dependency_python_roots: list[Path],
+) -> Path:
+    """Find the root directory containing a dependency python package."""
+    for root in [python_code_working_dir_root, *dependency_python_roots]:
+        candidate = root / dep_python_package_name / "src"
+        if candidate.exists():
+            return root
+    return python_code_working_dir_root
+
+
 def replace_duplicated_classes_with_imports(  # noqa: C901
     package_index,
     package_name,
     python_code_working_dir_root,
     python_code_working_dir,
     python_code_filename,
+    dependency_python_roots: list[Path] | None = None,
 ):
+    if dependency_python_roots is None:
+        dependency_python_roots = []
     for subpath in ["", "v1"]:
         imports: dict[str, str] = {}
         for dep in package_index:
-            dep_python_package_name = dep.replace("world.", "") + "-python"
+            dep_python_package_name = _get_python_package_name(dep)
             if dep != package_name:
                 # open the result _model.py file
-                dep_python_code_working_dir = (
-                    python_code_working_dir_root / dep_python_package_name / "src"
+                dep_root = _find_dep_python_root(
+                    dep_python_package_name,
+                    python_code_working_dir_root,
+                    dependency_python_roots,
                 )
+                dep_python_code_working_dir = dep_root / dep_python_package_name / "src"
                 for component in dep_python_package_name.replace("-python", "").split(
                     "."
                 ):
@@ -351,7 +432,12 @@ def replace_duplicated_classes_with_imports(  # noqa: C901
         uuid_pattern = re.compile(r'"uuid":\s*"([^"]+)"')
         dep_uuids = {}  # uuid -> (dep_package, class_name)
         for dep_pkg, _classes in imports.items():
-            dep_dir = python_code_working_dir_root / (dep_pkg + "-python") / "src"
+            dep_root = _find_dep_python_root(
+                dep_pkg + "-python",
+                python_code_working_dir_root,
+                dependency_python_roots,
+            )
+            dep_dir = dep_root / (dep_pkg + "-python") / "src"
             for component in dep_pkg.split("."):
                 dep_dir /= component
             dep_file = (
@@ -488,17 +574,28 @@ def replace_duplicated_classes_with_imports(  # noqa: C901
 
 
 def build_packages(
-    packages: list[str], python_code_working_dir_root: Path, commit: bool = False
+    packages: list[str],
+    python_code_working_dir_root: Path,
+    commit: bool = False,
+    github_token: str | None = None,
+    dependency_python_roots: list[Path] | None = None,
+    repo_org: str | None = None,
+    repo_org_map: dict[str, str] | None = None,
 ):
+    global default_repo_org, repo_org_overrides
+    if repo_org is not None:
+        default_repo_org = repo_org
+    if repo_org_map is not None:
+        repo_org_overrides = repo_org_map
     for package in packages:
         package_name = package.split("@")[0]
         package_version = package.split("@")[1] if "@" in package else None
         if package_version is None:
-            package_version = get_lastest_version(package_name)
+            package_version = get_lastest_version(package_name, github_token)
 
         # define python repo url,
         # e.g. https://github.com/OpenSemanticWorld-Packages/opensemantic.core-python
-        python_package_name = package_name.replace("world.", "") + "-python"
+        python_package_name = _get_python_package_name(package_name)
         # python_git_url = (
         #     "https://github.com/OpenSemanticWorld-Packages/" + python_package_name
         # )
@@ -532,13 +629,13 @@ def build_packages(
         )
 
         package_index: dict[str, dict[str, WtPage]] = {}
-        result = download_schema_package(package_name, package_version)
+        result = download_schema_package(package_name, package_version, github_token)
         p_key = result.package_bundle.packages.keys().__iter__().__next__()
         dependencies = result.package_bundle.packages[p_key].requiredPackages
         while len(dependencies) > 0:
             dep = dependencies.pop()
             if dep not in package_index:
-                dep_result = download_schema_package(dep)
+                dep_result = download_schema_package(dep, github_token=github_token)
                 package_index[dep] = {page.title: page for page in dep_result.pages}
                 dep_p_key = (
                     dep_result.package_bundle.packages.keys().__iter__().__next__()
@@ -567,6 +664,7 @@ def build_packages(
             python_code_working_dir_root,
             python_code_working_dir,
             python_code_filename,
+            dependency_python_roots=dependency_python_roots,
         )
 
         # if the target dir is a git repo, tag it with the python package version
@@ -590,6 +688,9 @@ if __name__ == "__main__":
     # set log level info
     logging.basicConfig(level=logging.INFO)
 
+    # prompt for GitHub token (optional, needed for private repos)
+    _token = input("GitHub token (leave empty for public repos): ").strip() or None
+
     build_packages(
         # packages=["world.opensemantic.core@v0.53.2"],
         # packages=["world.opensemantic.base"],
@@ -601,4 +702,5 @@ if __name__ == "__main__":
         ],
         python_code_working_dir_root=Path(__file__).parents[4] / "python_packages",
         commit=False,
+        github_token=_token,
     )

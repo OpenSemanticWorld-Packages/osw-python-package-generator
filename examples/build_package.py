@@ -7,6 +7,9 @@ if __name__ == "__main__":
     # set log level info
     logging.basicConfig(level=logging.INFO)
 
+    # prompt for GitHub token (optional, needed for private repos)
+    _token = input("GitHub token (leave empty for public repos): ").strip() or None
+
     build_packages(
         # specific version
         # packages=["world.opensemantic.core@v0.53.2"],
@@ -20,4 +23,5 @@ if __name__ == "__main__":
         ],
         python_code_working_dir_root=Path(__file__).parents[3] / "python_packages",
         commit=False,
+        github_token=_token,
     )
