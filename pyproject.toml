@@ -7,6 +7,7 @@ requires-python = ">=3.10"
 dependencies = [
     "autoflake>=2.3.1",
     "gitpython>=3.1.46",
+    "oold>=0.16.2",
     "osw",
 ]
 
