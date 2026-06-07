@@ -344,6 +344,132 @@ def replace_duplicated_classes_with_imports(  # noqa: C901
                             content,
                         )
 
+        # UUID-based deduplication: detect classes that share a UUID with a
+        # dependency class but have a different name (e.g., SamplingInterval
+        # has the same UUID as Time from characteristics.quantitative).
+        # Replace with a shallow subclass that imports the dependency class.
+        uuid_pattern = re.compile(r'"uuid":\s*"([^"]+)"')
+        dep_uuids = {}  # uuid -> (dep_package, class_name)
+        for dep_pkg, _classes in imports.items():
+            dep_dir = python_code_working_dir_root / (dep_pkg + "-python") / "src"
+            for component in dep_pkg.split("."):
+                dep_dir /= component
+            dep_file = (
+                dep_dir / subpath / python_code_filename
+                if subpath
+                else dep_dir / python_code_filename
+            )
+            if dep_file.exists():
+                dep_code = dep_file.read_text(encoding="utf-8")
+                for cm in class_pattern.finditer(dep_code):
+                    dep_class_body = cm.group(1)
+                    dep_class_name = cm.group(2)
+                    uuid_m = uuid_pattern.search(dep_class_body)
+                    if uuid_m:
+                        dep_uuids[uuid_m.group(1)] = (dep_pkg, dep_class_name)
+
+        if dep_uuids:
+            for class_name, (full_match, _body) in list(class_bodies.items()):
+                uuid_m = uuid_pattern.search(full_match)
+                if uuid_m and uuid_m.group(1) in dep_uuids:
+                    dep_pkg, dep_class_name = dep_uuids[uuid_m.group(1)]
+                    if class_name != dep_class_name:
+                        import_path = dep_pkg
+                        if subpath:
+                            import_path += "." + subpath
+                        # Check if this class is actually used elsewhere
+                        # (not just its own definition). Use negative
+                        # lookbehind for _ to avoid matching _ClassName
+                        usage_count = (
+                            len(
+                                re.findall(
+                                    r"(?<![_\w])" + re.escape(class_name) + r"(?!\w)",
+                                    content,
+                                )
+                            )
+                            - 1
+                        )  # subtract the class definition itself
+                        if usage_count <= 0:
+                            # Unused - just remove entirely
+                            _logger.info(
+                                f"Removing unused class {class_name} "
+                                f"(same UUID as {dep_class_name} "
+                                f"from {dep_pkg})"
+                            )
+                            content = content.replace(full_match, "")
+                        else:
+                            _logger.info(
+                                f"Replacing {class_name} with shallow "
+                                f"subclass of {dep_class_name} from "
+                                f"{dep_pkg} (same UUID: {uuid_m.group(1)})"
+                            )
+                            shallow = (
+                                f"class {class_name}({dep_class_name}):\n    pass\n\n\n"
+                            )
+                            content = content.replace(full_match, shallow)
+                            # Ensure the dep class is imported
+                            import_line = f"from {import_path} import {dep_class_name}"
+                            if import_line not in content:
+                                content = import_line + "\n" + content
+
+        # Remove pass-only subclasses that merely re-wrap an imported class
+        # e.g. class Tool1(Tool):\n    pass\n when Tool is imported
+        pass_class_pattern = re.compile(
+            r"^class\s+(\w+)\s*\((\w+)\)\s*:\s*\n\s+pass\s*\n+",
+            re.MULTILINE,
+        )
+        for m in pass_class_pattern.finditer(content):
+            class_name = m.group(1)
+            base_name = m.group(2)
+            # Check if base is imported (not defined locally)
+            if re.search(
+                r"^class\s+" + re.escape(base_name) + r"\s*\(", content, re.MULTILINE
+            ):
+                continue  # base is locally defined, keep the subclass
+            # Skip SamplingInterval/RefreshInterval-style classes that
+            # are intentional shallow subclasses created by UUID dedup
+            # (they will later get field overrides from allOf schemas)
+            # Remove model_rebuild/update_forward_refs before counting
+            content = re.sub(
+                r"^" + re.escape(class_name) + r"\.model_rebuild\(\)\n",
+                "",
+                content,
+                flags=re.MULTILINE,
+            )
+            content = re.sub(
+                r"^" + re.escape(class_name) + r"\.update_forward_refs\(\)\n",
+                "",
+                content,
+                flags=re.MULTILINE,
+            )
+            # Check if this class is used anywhere besides its definition
+            usage_count = (
+                len(
+                    re.findall(
+                        r"(?<![_\w])" + re.escape(class_name) + r"(?!\w)", content
+                    )
+                )
+                - 1
+            )  # subtract class def
+            if usage_count <= 0:
+                _logger.info(
+                    f"Removing orphaned pass-only class {class_name}({base_name})"
+                )
+                content = content.replace(m.group(0), "")
+            else:
+                # Class is used but is just a pass-only wrapper of an
+                # imported base. Replace all references with the base.
+                _logger.info(
+                    f"Collapsing pass-only class {class_name} into "
+                    f"{base_name} (replacing all references)"
+                )
+                content = content.replace(m.group(0), "")
+                content = re.sub(
+                    r"(?<![_\w])" + re.escape(class_name) + r"(?!\w)",
+                    base_name,
+                    content,
+                )
+
         # run formatting tool black on the combined content
         # consolidate imports as well
         try:
