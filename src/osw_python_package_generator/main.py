@@ -18,7 +18,7 @@ from osw.wtsite import WtPage, WtSite
 
 _logger = logging.getLogger(__name__)
 
-script_version = "0.2.3"
+script_version = "0.2.5"
 
 python_code_filename = "_model.py"
 
@@ -267,7 +267,123 @@ def generate_python_dataclasses(
         for error_message in res.error_messages:
             _logger.error(f"Schema fetch error: {error_message}")
 
+    # Fix missing allOf base classes that datamodel-code-generator dropped.
+    # When a schema has allOf: [$ref-A, $ref-B], the generator sometimes
+    # produces class X(B) instead of class X(A, B).
+    _fix_missing_allof_bases(schema_pages, offline_pages, python_code_path)
+    _fix_missing_allof_bases(schema_pages, offline_pages, python_code_path_v1)
+
     return [python_code_path, python_code_path_v1]
+
+
+def _fix_missing_allof_bases(  # noqa: C901
+    schema_pages: dict,
+    offline_pages: dict,
+    code_path: Path,
+) -> None:
+    """Ensure generated classes inherit from all allOf base classes."""
+
+    # Build map: schema title -> expected base class names from allOf
+    expected_bases = {}
+    for _title, page in schema_pages.items():
+        schema = page.get_slot_content("jsonschema")
+        if not isinstance(schema, dict):
+            continue
+        class_name = schema.get("title")
+        if not class_name:
+            continue
+        allof = schema.get("allOf", [])
+        bases = []
+        for entry in allof:
+            ref = entry.get("$ref", "")
+            # Extract Category:OSW... or Category:Item from $ref
+            ref_title = ref.split("?")[0].split("/wiki/")[-1] if "/wiki/" in ref else ""
+            if not ref_title:
+                continue
+            # Find the referenced schema's title (class name)
+            ref_page = offline_pages.get(ref_title)
+            if ref_page:
+                ref_schema = ref_page.get_slot_content("jsonschema")
+                if isinstance(ref_schema, dict) and ref_schema.get("title"):
+                    bases.append(ref_schema["title"])
+        if len(bases) > 1:
+            expected_bases[class_name] = bases
+
+    if not expected_bases:
+        return
+
+    content = code_path.read_text(encoding="utf-8")
+    changed = False
+    for class_name, bases in expected_bases.items():
+        # Fix both the exact class name and numbered variants (e.g. Foo1, Foo2)
+        variant_pattern = re.compile(
+            r"^(class\s+" + re.escape(class_name) + r"\d*" + r"\s*\()([^)]+)(\)\s*:)",
+            re.MULTILINE,
+        )
+        for m in variant_pattern.finditer(content):
+            matched_name = (
+                content[m.start() : m.end()].split("(")[0].replace("class ", "").strip()
+            )
+            current_bases = [b.strip() for b in m.group(2).split(",")]
+            missing = [b for b in bases if b not in current_bases]
+            if missing:
+                new_bases = ", ".join(missing + current_bases)
+                old_text = m.group(0)
+                new_text = m.group(1) + new_bases + m.group(3)
+                content = content.replace(old_text, new_text, 1)
+                _logger.info(
+                    f"Fixed {matched_name}: added missing base(s) "
+                    f"{missing} -> {matched_name}({new_bases})"
+                )
+            changed = True
+
+    # Fix wrong type defaults: when allOf resolution picks up the wrong
+    # parent's type default (e.g. ComposedUnit gets QuantityUnit's type)
+    # Build title -> page mapping
+    title_to_page = {}
+    for _title, page in {**schema_pages, **offline_pages}.items():
+        s = page.get_slot_content("jsonschema")
+        if isinstance(s, dict) and s.get("title"):
+            title_to_page[s["title"]] = page
+    for class_name, _bases in expected_bases.items():
+        page = title_to_page.get(class_name)
+        if not page:
+            continue
+        schema_content = page.get_slot_content("jsonschema")
+        if not isinstance(schema_content, dict):
+            continue
+        expected_type = (
+            schema_content.get("properties", {}).get("type", {}).get("default")
+        )
+        if not expected_type:
+            continue
+        expected_str = json.dumps(expected_type)
+        # Find the class definition line, then find its type field
+        lines = content.split("\n")
+        in_class = False
+        for i, line in enumerate(lines):
+            if re.match(r"^class\s+" + re.escape(class_name) + r"\s*\(", line):
+                in_class = True
+                continue
+            if in_class:
+                # Detect end of class (next class or top-level code)
+                if line and not line[0].isspace() and line.strip():
+                    break
+                m = re.match(r"(\s+)type:\s*[^=]+=\s*(\[[^\]]+\])", line)
+                if m:
+                    old_type = m.group(2)
+                    if old_type != expected_str:
+                        lines[i] = line.replace(old_type, expected_str)
+                        _logger.info(
+                            f"Fixed {class_name} type default: "
+                            f"{old_type} -> {expected_str}"
+                        )
+                        changed = True
+                    break
+        content = "\n".join(lines)
+
+    if changed:
+        code_path.write_text(content, encoding="utf-8")
 
 
 def _find_dep_python_root(
@@ -372,19 +488,6 @@ def replace_duplicated_classes_with_imports(  # noqa: C901
                 )
 
             content = "\n".join(import_stms) + "\n" + content
-
-        # hot replacements
-        hotfix_replacements = {
-            # remain error in datamodel-codegen - unresolved titles
-            # in Association and other OUs
-            r"([l|L]ist)\[OSW44deaa5b806d41a2a88594f562b110e9\]": r"\1[Person]",
-            # in Sampling
-            r"([l|L]ist)\[OSW3d238d05316e45a4ac95a11d7b24e36b\]": r"\1[Location]",
-            r": OSW3d238d05316e45a4ac95a11d7b24e36b": r": Location",
-            r"([l|L]ist)\[OSWe427aafafbac4262955b9f690a83405d\]": r"\1[Tool]",
-        }
-        for key, value in hotfix_replacements.items():
-            content = re.sub(key, value, content)
 
         # deduplicate identical classes within the same file
         # e.g. Tool and Tool1 generated from the same schema via different $ref paths
@@ -497,6 +600,34 @@ def replace_duplicated_classes_with_imports(  # noqa: C901
                             import_line = f"from {import_path} import {dep_class_name}"
                             if import_line not in content:
                                 content = import_line + "\n" + content
+
+        # Replace raw OSW ID type annotations with class names from deps
+        osw_id_map = {}
+        for uuid_str, (_dep_pkg, dep_class_name) in dep_uuids.items():
+            osw_id = "OSW" + uuid_str.replace("-", "")
+            osw_id_map[osw_id] = dep_class_name
+        # Also include locally defined classes
+        for class_name, (full_match, _) in class_bodies.items():
+            uuid_m = uuid_pattern.search(full_match)
+            if uuid_m:
+                osw_id = "OSW" + uuid_m.group(1).replace("-", "")
+                osw_id_map[osw_id] = class_name
+        for osw_id, class_name in osw_id_map.items():
+            if osw_id in content:
+                # Only replace in type annotations (: OSW..., list[OSW...],
+                # | OSW...), not inside string literals
+                # Process line by line to skip lines containing quotes
+                new_lines = []
+                for line in content.splitlines(True):
+                    if osw_id in line and '"' not in line and "'" not in line:
+                        line = re.sub(
+                            r"(?<![_\w])" + re.escape(osw_id) + r"(?!\w)",
+                            class_name,
+                            line,
+                        )
+                    new_lines.append(line)
+                content = "".join(new_lines)
+                _logger.info(f"Replaced raw OSW ID {osw_id} with {class_name}")
 
         # Remove pass-only subclasses that merely re-wrap an imported class
         # e.g. class Tool1(Tool):\n    pass\n when Tool is imported
