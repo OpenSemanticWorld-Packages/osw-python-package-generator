@@ -692,6 +692,39 @@ def replace_duplicated_classes_with_imports(  # noqa: C901
                     content,
                 )
 
+        # Remove duplicate class definitions (same name, keep first)
+        seen_classes = set()
+        deduped_lines = []
+        in_dup = False
+        for line in content.split("\n"):
+            cls_match = re.match(r"^class (\w+)\(", line)
+            if cls_match:
+                cls_name = cls_match.group(1)
+                if cls_name in seen_classes:
+                    _logger.info(
+                        f"Removing duplicate class {cls_name} "
+                        f"(keeping first occurrence)"
+                    )
+                    in_dup = True
+                    continue
+                seen_classes.add(cls_name)
+                in_dup = False
+            elif in_dup:
+                # Skip lines belonging to the duplicate class
+                # (indented or blank lines between classes)
+                if line and not line[0].isspace() and line.strip():
+                    # Non-indented non-blank line = end of dup class
+                    # Check if it's a model_rebuild() for the dup
+                    if re.match(r"\w+\.model_rebuild\(\)", line):
+                        continue
+                    if re.match(r"\w+\.update_forward_refs\(\)", line):
+                        continue
+                    in_dup = False
+                else:
+                    continue
+            deduped_lines.append(line)
+        content = "\n".join(deduped_lines)
+
         # run formatting tool black on the combined content
         # consolidate imports as well
         try:
