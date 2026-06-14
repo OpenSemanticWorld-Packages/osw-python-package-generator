@@ -742,7 +742,7 @@ def replace_duplicated_classes_with_imports(  # noqa: C901
             file.write(content)
 
 
-def build_packages(
+def build_packages(  # noqa: C901
     packages: list[str],
     python_code_working_dir_root: Path,
     commit: bool = False,
@@ -835,6 +835,39 @@ def build_packages(
             python_code_filename,
             dependency_python_roots=dependency_python_roots,
         )
+
+        # run pre-commit hooks (formatting, linting) if available in target repo
+        repo_dir = python_code_working_dir_root / python_package_name
+        try:
+            import subprocess
+
+            result = subprocess.run(
+                ["pre-commit", "run", "--all-files"],
+                cwd=repo_dir,
+                capture_output=True,
+                text=True,
+            )
+            if result.returncode == 0:
+                _logger.info(f"pre-commit passed for {python_package_name}")
+            elif result.returncode == 1:
+                _logger.info(
+                    f"pre-commit auto-fixed files in {python_package_name}, "
+                    f"re-running to verify"
+                )
+                result2 = subprocess.run(
+                    ["pre-commit", "run", "--all-files"],
+                    cwd=repo_dir,
+                    capture_output=True,
+                    text=True,
+                )
+                if result2.returncode != 0:
+                    _logger.warning(
+                        f"pre-commit still failing: {result2.stdout[-500:]}"
+                    )
+            else:
+                _logger.warning(f"pre-commit failed: {result.stderr[-500:]}")
+        except FileNotFoundError:
+            _logger.debug("pre-commit not available, skipping formatting hooks")
 
         # if the target dir is a git repo, tag it with the python package version
         if commit:
