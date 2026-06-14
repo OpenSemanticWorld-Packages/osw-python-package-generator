@@ -619,7 +619,12 @@ def replace_duplicated_classes_with_imports(  # noqa: C901
                 # Process line by line to skip lines containing quotes
                 new_lines = []
                 for line in content.splitlines(True):
-                    if osw_id in line and '"' not in line and "'" not in line:
+                    if (
+                        osw_id in line
+                        and '"' not in line
+                        and "'" not in line
+                        and not line.lstrip().startswith("#")
+                    ):
                         line = re.sub(
                             r"(?<![_\w])" + re.escape(osw_id) + r"(?!\w)",
                             class_name,
