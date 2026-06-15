@@ -18,24 +18,40 @@ from osw.wtsite import WtPage, WtSite
 
 _logger = logging.getLogger(__name__)
 
-script_version = "0.3.0"
+script_version = "0.3.1"
 
 python_code_filename = "_model.py"
 
-# Create/update the password file under examples/accounts.pwd.yaml
+# Default credentials file location (next to this module). Override via
+# build_packages(cred_filepath=...) - useful when the generator is installed
+# as a dependency and the credentials live in the consuming project.
 pwd_file_path = os.path.join(
     os.path.dirname(os.path.abspath(__file__)), "accounts.pwd.yaml"
 )
 
-# login to demo.open-semantic-lab.org
-osw_obj = OSW(
-    site=WtSite(
-        WtSite.WtSiteConfig(
-            iri="wiki-dev.open-semantic-lab.org",
-            cred_mngr=CredentialManager(cred_filepath=pwd_file_path),
+# Shared OSW client, lazily initialized on first use (see _get_osw). Kept
+# lazy so importing this module does not trigger a wiki login / credential
+# prompt - the build downloads schema packages from GitHub.
+osw_obj = None
+
+
+def _get_osw(cred_filepath: "str | Path | None" = None):
+    """Return the shared OSW client, creating it on first use.
+
+    cred_filepath overrides the default accounts.pwd.yaml location.
+    """
+    global osw_obj
+    if osw_obj is None:
+        cred_path = str(cred_filepath) if cred_filepath else pwd_file_path
+        osw_obj = OSW(
+            site=WtSite(
+                WtSite.WtSiteConfig(
+                    iri="wiki-dev.open-semantic-lab.org",
+                    cred_mngr=CredentialManager(cred_filepath=cred_path),
+                )
+            )
         )
-    )
-)
+    return osw_obj
 
 default_repo_org = "OpenSemanticWorld-Packages"
 
@@ -147,7 +163,7 @@ def download_schema_package(
         extracted_files = os.listdir(temp_dir)
         print(f"Extracted files: {extracted_files}")
 
-        result = osw_obj.site.read_page_package(
+        result = _get_osw().site.read_page_package(
             WtSite.ReadPagePackageParam(
                 storage_path=os.path.join(
                     temp_dir,
@@ -221,7 +237,7 @@ def generate_python_dataclasses(
     python_code_path.touch(exist_ok=True)
     python_code_path_v1.touch(exist_ok=True)
 
-    res = osw_obj.fetch_schema(
+    res = _get_osw().fetch_schema(
         fetchSchemaParam=OSW.FetchSchemaParam(
             schema_title=schema_titles,
             offline_pages=offline_pages,
@@ -241,7 +257,7 @@ def generate_python_dataclasses(
         for error_message in res.error_messages:
             _logger.error(f"Schema fetch error: {error_message}")
 
-    res = osw_obj.fetch_schema(
+    res = _get_osw().fetch_schema(
         fetchSchemaParam=OSW.FetchSchemaParam(
             schema_title=schema_titles,
             offline_pages=offline_pages,
@@ -750,12 +766,17 @@ def build_packages(  # noqa: C901
     dependency_python_roots: list[Path] | None = None,
     repo_org: str | None = None,
     repo_org_map: dict[str, str] | None = None,
+    cred_filepath: "str | Path | None" = None,
 ):
     global default_repo_org, repo_org_overrides
     if repo_org is not None:
         default_repo_org = repo_org
     if repo_org_map is not None:
         repo_org_overrides = repo_org_map
+    # initialize the shared OSW client with the given credentials (if any)
+    # before any download/fetch happens
+    if cred_filepath is not None:
+        _get_osw(cred_filepath)
     for package in packages:
         package_name = package.split("@")[0]
         package_version = package.split("@")[1] if "@" in package else None
