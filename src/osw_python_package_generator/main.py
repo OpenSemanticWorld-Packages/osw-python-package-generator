@@ -2,6 +2,7 @@ import json
 import logging
 import os
 import re
+import shutil
 import tempfile
 import urllib.error
 import urllib.request
@@ -18,7 +19,7 @@ from osw.wtsite import WtPage, WtSite
 
 _logger = logging.getLogger(__name__)
 
-script_version = "0.3.2"
+script_version = "0.4.0"
 
 python_code_filename = "_model.py"
 
@@ -60,6 +61,7 @@ def _get_osw(
             )
         )
     return osw_obj
+
 
 default_repo_org = "OpenSemanticWorld-Packages"
 
@@ -108,9 +110,13 @@ def _build_request(url: str, github_token: str | None = None) -> urllib.request.
     return req
 
 
-def get_lastest_version(package_name, github_token: str | None = None):
-    # determine latest tag
-    git_url = "https://github.com/" + _get_repo_org(package_name) + "/" + package_name
+def get_lastest_version(
+    package_name, github_token: str | None = None, repo_org: str | None = None
+):
+    # determine latest tag. repo_org overrides the prefix-derived org - needed
+    # for *-python repos whose name no longer carries the package prefix.
+    org = repo_org or _get_repo_org(package_name)
+    git_url = "https://github.com/" + org + "/" + package_name
     # e.g. https://api.github.com/repos/OpenSemanticWorld-Packages/world.opensemantic.core/tags
     package_versions_url = (
         git_url.replace("github.com", "api.github.com/repos") + "/tags"
@@ -134,54 +140,107 @@ def get_lastest_version(package_name, github_token: str | None = None):
 def download_schema_package(
     package_name, package_version=None, github_token: str | None = None
 ) -> WtSite.ReadPagePackageResult:
-    # define repo url, e.g. https://github.com/OpenSemanticWorld-Packages/world.opensemantic.core
-    git_url = "https://github.com/" + _get_repo_org(package_name) + "/" + package_name
-
-    if package_version is None:
-        package_version = get_lastest_version(package_name, github_token)
-
-    if package_version is None:
-        raise ValueError(
-            f"No tags found for package {package_name} "
-            f"in {_get_repo_org(package_name)} - cannot determine version"
-        )
-
-    _logger.info(f"Downloading schema package {package_name} version {package_version}")
-
-    git_zip_url = git_url + "/archive/refs/tags/" + package_version + ".zip"
-    # download package as zip
-    # using a temp dir
+    _logger.info(f"Downloading schema package {package_name} {package_version or ''}")
+    # download + extract the repo zip into a temp dir, then read the page
+    # package from the extracted files
     with tempfile.TemporaryDirectory() as temp_dir:
-        zip_path = os.path.join(temp_dir, "downloaded.zip")
-
-        # S310 Audit URL open for permitted schemes.
-        if not git_zip_url.startswith(("http:", "https:")):
-            raise ValueError("URL must start with 'http:' or 'https:'")
-
-        # Download the ZIP file
-        req = _build_request(git_zip_url, github_token)
-        with urllib.request.urlopen(req) as response, open(zip_path, "wb") as f:  # nosec S310, url validated
-            f.write(response.read())
-
-        # Extract the ZIP file
-        with zipfile.ZipFile(zip_path, "r") as zip_ref:
-            zip_ref.extractall(temp_dir)
-
-        # List all extracted files
-        extracted_files = os.listdir(temp_dir)
-        print(f"Extracted files: {extracted_files}")
-
+        package_dir = download_repo_zip(
+            _get_repo_org(package_name),
+            package_name,
+            temp_dir,
+            github_token=github_token,
+            version=package_version,
+        )
         result = _get_osw().site.read_page_package(
-            WtSite.ReadPagePackageParam(
-                storage_path=os.path.join(
-                    temp_dir,
-                    package_name + "-" + package_version[1:]
-                    if package_version.startswith("v")
-                    else package_version,
-                )
-            )
+            WtSite.ReadPagePackageParam(storage_path=str(package_dir))
         )
     return result
+
+
+def download_repo_zip(
+    repo_org: str,
+    repo_name: str,
+    dest_root: "str | Path",
+    github_token: str | None = None,
+    version: str | None = None,
+) -> Path:
+    """Download a GitHub repo as a tag zip and extract it under dest_root.
+
+    The GitHub ``<repo>-<version>`` wrapper folder is stripped so the result
+    lives at ``<dest_root>/<repo_name>/`` (matching the on-disk layout the
+    dedup and required-page checks expect). Always downloads fresh: an
+    existing ``<dest_root>/<repo_name>`` is removed first. Returns that dir.
+    """
+    if version is None:
+        version = get_lastest_version(repo_name, github_token, repo_org=repo_org)
+    if version is None:
+        raise ValueError(f"No tags found for {repo_org}/{repo_name}")
+
+    zip_url = (
+        f"https://github.com/{repo_org}/{repo_name}/archive/refs/tags/{version}.zip"
+    )
+    # S310 Audit URL open for permitted schemes.
+    if not zip_url.startswith(("http:", "https:")):
+        raise ValueError("URL must start with 'http:' or 'https:'")
+
+    dest_root = Path(dest_root)
+    dest_root.mkdir(parents=True, exist_ok=True)
+    package_dir = dest_root / repo_name
+    if package_dir.exists():
+        shutil.rmtree(package_dir)  # always fetch fresh, never reuse stale
+
+    with tempfile.TemporaryDirectory() as temp_dir:
+        zip_path = os.path.join(temp_dir, "downloaded.zip")
+        req = _build_request(zip_url, github_token)
+        with urllib.request.urlopen(req) as response, open(zip_path, "wb") as f:  # nosec S310, url validated
+            f.write(response.read())
+        with zipfile.ZipFile(zip_path, "r") as zip_ref:
+            zip_ref.extractall(temp_dir)
+        # a tag zip extracts to a single <repo>-<version> top-level folder
+        extracted = [
+            Path(temp_dir) / name
+            for name in os.listdir(temp_dir)
+            if (Path(temp_dir) / name).is_dir()
+        ]
+        if not extracted:
+            raise RuntimeError(f"No folder extracted from {zip_url}")
+        shutil.move(str(extracted[0]), str(package_dir))
+
+    _logger.info(f"Downloaded {repo_org}/{repo_name}@{version} -> {package_dir}")
+    return package_dir
+
+
+def download_schema_package_dirs(
+    package_names: list[str],
+    dest_root: "str | Path | None" = None,
+    github_token: str | None = None,
+    repo_org: str | None = None,
+    repo_org_map: dict[str, str] | None = None,
+) -> Path:
+    """Download schema package repos (latest tag) as zips into a fresh dir.
+
+    One subfolder per package, named after the package. The returned dir is
+    suitable for ``check_required_pages(additional_package_dirs=[...])`` -
+    feeding upstream packages without requiring a local sibling checkout.
+    Always fetches fresh (a new temp dir unless dest_root is given).
+    """
+    global default_repo_org, repo_org_overrides
+    if repo_org is not None:
+        default_repo_org = repo_org
+    if repo_org_map is not None:
+        repo_org_overrides = repo_org_map
+
+    if dest_root is None:
+        dest_root = Path(tempfile.mkdtemp(prefix="osw_schema_pkgs_"))
+    dest_root = Path(dest_root)
+    for name in package_names:
+        try:
+            download_repo_zip(
+                _get_repo_org(name), name, dest_root, github_token=github_token
+            )
+        except Exception as e:
+            _logger.warning(f"Could not download schema package {name}: {e}")
+    return dest_root
 
 
 def is_git_repo(directory):
@@ -857,13 +916,44 @@ def build_packages(  # noqa: C901
             pages, offline_pages, python_code_working_dir, python_code_filename
         )
 
+        # Dedup against dependency python packages. Resolve each dependency's
+        # generated models from disk if available (local working dir or a
+        # supplied dependency_python_root, e.g. an in-progress sibling
+        # checkout); otherwise fetch the released *-python repo fresh from
+        # GitHub. Local roots take precedence so in-progress work is not
+        # shadowed by a published release; the auto-download is the fallback.
+        effective_dep_roots = list(dependency_python_roots or [])
+        auto_root: Path | None = None
+        search_roots = [python_code_working_dir_root, *effective_dep_roots]
+        for dep in package_index:
+            dep_python_name = _get_python_package_name(dep)
+            if any(
+                (Path(root) / dep_python_name / "src").exists() for root in search_roots
+            ):
+                continue  # already on disk - use it, do not download
+            if auto_root is None:
+                auto_root = Path(tempfile.mkdtemp(prefix="osw_dep_python_"))
+            try:
+                download_repo_zip(
+                    _get_repo_org(dep),
+                    dep_python_name,
+                    auto_root,
+                    github_token=github_token,
+                )
+            except Exception as e:
+                _logger.warning(
+                    f"Could not auto-download python package {dep_python_name}: {e}"
+                )
+        if auto_root is not None:
+            effective_dep_roots.append(auto_root)  # fallback, lowest precedence
+
         replace_duplicated_classes_with_imports(
             package_index,
             package_name,
             python_code_working_dir_root,
             python_code_working_dir,
             python_code_filename,
-            dependency_python_roots=dependency_python_roots,
+            dependency_python_roots=effective_dep_roots,
         )
 
         # run pre-commit hooks (formatting, linting) if available in target repo

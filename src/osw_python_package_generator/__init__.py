@@ -1,1 +1,5 @@
-from .main import build_packages  # noqa: F401
+from .main import (  # noqa: F401
+    build_packages,
+    download_repo_zip,
+    download_schema_package_dirs,
+)
