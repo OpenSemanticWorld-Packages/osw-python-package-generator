@@ -18,7 +18,7 @@ from osw.wtsite import WtPage, WtSite
 
 _logger = logging.getLogger(__name__)
 
-script_version = "0.3.1"
+script_version = "0.3.2"
 
 python_code_filename = "_model.py"
 
@@ -29,16 +29,24 @@ pwd_file_path = os.path.join(
     os.path.dirname(os.path.abspath(__file__)), "accounts.pwd.yaml"
 )
 
+# Default wiki domain. Override via build_packages(wiki_iri=...) to target a
+# different OSW instance (e.g. a project-specific wiki).
+default_wiki_iri = "wiki-dev.open-semantic-lab.org"
+
 # Shared OSW client, lazily initialized on first use (see _get_osw). Kept
 # lazy so importing this module does not trigger a wiki login / credential
 # prompt - the build downloads schema packages from GitHub.
 osw_obj = None
 
 
-def _get_osw(cred_filepath: "str | Path | None" = None):
+def _get_osw(
+    cred_filepath: "str | Path | None" = None,
+    wiki_iri: "str | None" = None,
+):
     """Return the shared OSW client, creating it on first use.
 
     cred_filepath overrides the default accounts.pwd.yaml location.
+    wiki_iri overrides the default wiki domain.
     """
     global osw_obj
     if osw_obj is None:
@@ -46,7 +54,7 @@ def _get_osw(cred_filepath: "str | Path | None" = None):
         osw_obj = OSW(
             site=WtSite(
                 WtSite.WtSiteConfig(
-                    iri="wiki-dev.open-semantic-lab.org",
+                    iri=wiki_iri or default_wiki_iri,
                     cred_mngr=CredentialManager(cred_filepath=cred_path),
                 )
             )
@@ -767,16 +775,17 @@ def build_packages(  # noqa: C901
     repo_org: str | None = None,
     repo_org_map: dict[str, str] | None = None,
     cred_filepath: "str | Path | None" = None,
+    wiki_iri: "str | None" = None,
 ):
     global default_repo_org, repo_org_overrides
     if repo_org is not None:
         default_repo_org = repo_org
     if repo_org_map is not None:
         repo_org_overrides = repo_org_map
-    # initialize the shared OSW client with the given credentials (if any)
-    # before any download/fetch happens
-    if cred_filepath is not None:
-        _get_osw(cred_filepath)
+    # initialize the shared OSW client with the given credentials / wiki
+    # domain (if any) before any download/fetch happens
+    if cred_filepath is not None or wiki_iri is not None:
+        _get_osw(cred_filepath, wiki_iri)
     for package in packages:
         package_name = package.split("@")[0]
         package_version = package.split("@")[1] if "@" in package else None
