@@ -29,9 +29,9 @@ pwd_file_path = os.path.join(
     os.path.dirname(os.path.abspath(__file__)), "accounts.pwd.yaml"
 )
 
-# Default wiki domain. Override via build_packages(wiki_iri=...) to target a
-# different OSW instance (e.g. a project-specific wiki).
-default_wiki_iri = "wiki-dev.open-semantic-lab.org"
+# Default OSW wiki domain. Override via build_packages(osw_domain=...) to
+# target a different OSW instance (e.g. a project-specific wiki).
+default_osw_domain = "wiki-dev.open-semantic-lab.org"
 
 # Shared OSW client, lazily initialized on first use (see _get_osw). Kept
 # lazy so importing this module does not trigger a wiki login / credential
@@ -41,12 +41,12 @@ osw_obj = None
 
 def _get_osw(
     cred_filepath: "str | Path | None" = None,
-    wiki_iri: "str | None" = None,
+    osw_domain: "str | None" = None,
 ):
     """Return the shared OSW client, creating it on first use.
 
     cred_filepath overrides the default accounts.pwd.yaml location.
-    wiki_iri overrides the default wiki domain.
+    osw_domain overrides the default OSW wiki domain.
     """
     global osw_obj
     if osw_obj is None:
@@ -54,7 +54,7 @@ def _get_osw(
         osw_obj = OSW(
             site=WtSite(
                 WtSite.WtSiteConfig(
-                    iri=wiki_iri or default_wiki_iri,
+                    iri=osw_domain or default_osw_domain,
                     cred_mngr=CredentialManager(cred_filepath=cred_path),
                 )
             )
@@ -775,7 +775,7 @@ def build_packages(  # noqa: C901
     repo_org: str | None = None,
     repo_org_map: dict[str, str] | None = None,
     cred_filepath: "str | Path | None" = None,
-    wiki_iri: "str | None" = None,
+    osw_domain: "str | None" = None,
 ):
     global default_repo_org, repo_org_overrides
     if repo_org is not None:
@@ -784,8 +784,8 @@ def build_packages(  # noqa: C901
         repo_org_overrides = repo_org_map
     # initialize the shared OSW client with the given credentials / wiki
     # domain (if any) before any download/fetch happens
-    if cred_filepath is not None or wiki_iri is not None:
-        _get_osw(cred_filepath, wiki_iri)
+    if cred_filepath is not None or osw_domain is not None:
+        _get_osw(cred_filepath, osw_domain)
     for package in packages:
         package_name = package.split("@")[0]
         package_version = package.split("@")[1] if "@" in package else None
