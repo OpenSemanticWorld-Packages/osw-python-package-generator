@@ -18,7 +18,7 @@ from osw.wtsite import WtPage, WtSite
 
 _logger = logging.getLogger(__name__)
 
-script_version = "0.2.5"
+script_version = "0.3.0"
 
 python_code_filename = "_model.py"
 
