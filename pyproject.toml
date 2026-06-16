@@ -8,11 +8,10 @@ dependencies = [
     "autoflake>=2.3.1",
     "gitpython>=3.1.46",
     "oold>=0.16.2",
-    "osw",
+    # 1.1.2 is the first release with the OSW-ID-in-comment fix (filename
+    # headers) and the pytest/prefect/anyio CI fixes
+    "osw>=1.1.2",
 ]
-
-[tool.uv.sources]
-osw = { git = "https://github.com/OpenSemanticLab/osw-python" }
 
 [build-system]
 requires = ["hatchling"]

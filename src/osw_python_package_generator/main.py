@@ -19,7 +19,7 @@ from osw.wtsite import WtPage, WtSite
 
 _logger = logging.getLogger(__name__)
 
-script_version = "0.4.0"
+script_version = "0.4.1"
 
 python_code_filename = "_model.py"
 
