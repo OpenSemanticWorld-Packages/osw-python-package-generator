@@ -19,7 +19,7 @@ from osw.wtsite import WtPage, WtSite
 
 _logger = logging.getLogger(__name__)
 
-script_version = "0.4.1"
+script_version = "0.4.2"
 
 python_code_filename = "_model.py"
 
@@ -825,6 +825,57 @@ def replace_duplicated_classes_with_imports(  # noqa: C901
             file.write(content)
 
 
+def replace_unit_enums(python_code_working_dir, python_code_filename) -> None:
+    """Rewrite OSW unit enums to subclass UnitEnum instead of stdlib Enum.
+
+    A unit enum is a generated ``class <Name>Unit(Enum)`` whose members are OSW unit
+    Item ids (``Item:OSW...``). Subclassing ``UnitEnum`` (str + a registering
+    metaclass, defined in ``opensemantic.characteristics.quantitative._enum``) makes
+    the members str-valued and registers them in the shared unit_registry, which
+    enables pint conversion (``to_unit``/``from_pint``). Non-unit enums (e.g. code
+    enums, or ``<Name>Unit`` enums without unit members) keep stdlib ``Enum``.
+    Applies to both pydantic versions. Idempotent.
+    """
+    unit_enum_import = (
+        "from opensemantic.characteristics.quantitative._enum import UnitEnum"
+    )
+    block_re = re.compile(
+        r"^class (?P<name>\w+Unit)\(Enum\):.*\n(?:[ \t].*\n|\n)*",
+        re.MULTILINE,
+    )
+
+    def repl(m):
+        block = m.group(0)
+        if "Item:OSW" not in block:
+            return block  # not a unit enum - members are not OSW unit Items
+        name = m.group("name")
+        return block.replace(f"class {name}(Enum):", f"class {name}(UnitEnum):", 1)
+
+    for subpath in ["", "v1"]:
+        work_dir = (
+            python_code_working_dir / subpath if subpath else python_code_working_dir
+        )
+        model_path = work_dir / python_code_filename
+        if not model_path.exists():
+            continue
+        text = model_path.read_text(encoding="utf-8")
+        new_text = block_re.sub(repl, text)
+        if new_text == text:
+            continue  # no unit enums to swap
+        if unit_enum_import not in new_text:
+            future = "from __future__ import annotations\n"
+            if future in new_text:
+                new_text = new_text.replace(future, future + unit_enum_import + "\n", 1)
+            else:
+                new_text = unit_enum_import + "\n" + new_text
+        # drop the now-unused stdlib `from enum import Enum` if nothing else
+        # references a bare Enum (i.e. every enum in the file was a unit enum)
+        if len(re.findall(r"(?<![A-Za-z_])Enum(?![A-Za-z_])", new_text)) == 1:
+            new_text = new_text.replace("from enum import Enum\n", "", 1)
+        model_path.write_text(new_text, encoding="utf-8")
+        _logger.info(f"Swapped unit enums to UnitEnum in {model_path}")
+
+
 def build_packages(  # noqa: C901
     packages: list[str],
     python_code_working_dir_root: Path,
@@ -955,6 +1006,10 @@ def build_packages(  # noqa: C901
             python_code_filename,
             dependency_python_roots=effective_dep_roots,
         )
+
+        # rewrite OSW unit enums (class <Name>Unit(Enum) with Item:OSW members) to
+        # subclass UnitEnum so they register for pint conversion
+        replace_unit_enums(python_code_working_dir, python_code_filename)
 
         # run pre-commit hooks (formatting, linting) if available in target repo
         repo_dir = python_code_working_dir_root / python_package_name
