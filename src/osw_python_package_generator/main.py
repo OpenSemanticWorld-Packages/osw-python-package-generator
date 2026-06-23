@@ -19,7 +19,7 @@ from osw.wtsite import WtPage, WtSite
 
 _logger = logging.getLogger(__name__)
 
-script_version = "0.4.2"
+script_version = "0.4.3"
 
 python_code_filename = "_model.py"
 
@@ -683,6 +683,44 @@ def replace_duplicated_classes_with_imports(  # noqa: C901
                             import_line = f"from {import_path} import {dep_class_name}"
                             if import_line not in content:
                                 content = import_line + "\n" + content
+
+        # UUID-based within-package dedup (local-vs-local): a category that is
+        # both generated standalone and referenced inline via $ref + custom
+        # keywords yields a 2nd class with the same uuid but a different
+        # (property-derived) title - reuse_model does not merge these. Group the
+        # remaining local classes by uuid, keep the canonical one (clean category
+        # title - no underscore - else the first) and replace references to the
+        # duplicates with it, the same way numbered variants are collapsed above.
+        local_by_uuid: dict[str, list] = {}
+        for cm in class_pattern.finditer(content):
+            uuid_m = uuid_pattern.search(cm.group(1))
+            if uuid_m:
+                local_by_uuid.setdefault(uuid_m.group(1), []).append(
+                    (cm.group(2), cm.group(1))
+                )
+        for entries in local_by_uuid.values():
+            if len(entries) < 2:
+                continue
+
+            def _rank(entry):
+                name, body = entry
+                tm = re.search(r'"title":\s*"([^"]*)"', body)
+                # prefer a non-numbered name (not a Tool1 variant) with a clean
+                # category title (no underscore, i.e. not a property-derived name)
+                return (
+                    not name[-1:].isdigit(),
+                    tm is not None and "_" not in tm.group(1),
+                )
+
+            canon_name = max(entries, key=_rank)[0]
+            for name, body in entries:
+                if name == canon_name:
+                    continue
+                _logger.info(
+                    f"Collapsing duplicate class {name} into {canon_name} (same uuid)"
+                )
+                content = content.replace(body, "")
+                content = re.sub(r"\b" + re.escape(name) + r"\b", canon_name, content)
 
         # Replace raw OSW ID type annotations with class names from deps
         osw_id_map = {}
