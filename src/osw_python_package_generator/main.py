@@ -19,7 +19,7 @@ from osw.wtsite import WtPage, WtSite
 
 _logger = logging.getLogger(__name__)
 
-script_version = "0.4.3"
+script_version = "0.4.4"
 
 python_code_filename = "_model.py"
 
@@ -914,6 +914,261 @@ def replace_unit_enums(python_code_working_dir, python_code_filename) -> None:
         _logger.info(f"Swapped unit enums to UnitEnum in {model_path}")
 
 
+_ENUM_CLASS_RE = re.compile(
+    r"^class\s+(?P<name>\w+)\(\s*(?:(?:str|int)\s*,\s*)?(?:Enum|UnitEnum)\s*\)\s*:.*\n"
+    r"(?P<body>(?:(?!^class\s).*\n)*)",
+    re.MULTILINE,
+)
+
+# A member is either a literal (optionally wrapped in parens by black when the
+# line is long) or an indirection into a shared collection enum, e.g.
+# `milli_bar = Unit.milli_bar.value`.
+_ENUM_MEMBER_RE = re.compile(
+    r"^[ \t]+(?P<member>\w+)\s*=\s*"
+    r"(?P<value>\(\s*(?:\"[^\"]*\"|'[^']*')\s*\)|\"[^\"]*\"|'[^']*'|[\w.]+)",
+    re.MULTILINE,
+)
+
+_CLASS_BLOCK_RE = re.compile(
+    r"^class\s+(?P<name>\w+)\s*\(\s*(?P<bases>[^)]*)\)\s*:.*\n"
+    r"(?P<body>(?:(?!^class\s).*\n)*)",
+    re.MULTILINE,
+)
+
+_FIELD_TYPE_RE = re.compile(
+    r"^[ \t]+(?P<name>\w+)\s*:\s*(?P<type>[^=\n]+?)\s*=", re.MULTILINE
+)
+
+# A property override that only carried a `default` in the schema: the code
+# generator had no type to work from and inferred a bare scalar from the
+# literal. `Field(...)` defaults are excluded - those carry a real type.
+_SCALAR_DEFAULT_RE = re.compile(
+    r"^(?P<indent>[ \t]+)(?P<name>\w+)\s*:\s*"
+    r"(?:(?:str|int|float|bool)\s*\|\s*None|Optional\[(?:str|int|float|bool)\])"
+    r"\s*=\s*(?P<value>\(\s*(?:\"[^\"]*\"|'[^']*')\s*\)|\"[^\"]*\"|'[^']*'"
+    r"|-?\d+(?:\.\d+)?)[ \t]*$",
+    re.MULTILINE,
+)
+
+
+_NUMERIC_LITERAL_RE = re.compile(r"-?\d+(?:\.\d+)?|True|False")
+
+
+def _literal_value(raw: str) -> str:
+    """Normalize a python literal token to its plain value."""
+    raw = raw.strip()
+    if raw.startswith("("):
+        raw = raw[1:-1].strip()
+    if raw[:1] in ("'", '"'):
+        return raw[1:-1]
+    return raw
+
+
+def _strip_optional(type_str: str) -> str:
+    """Reduce `X | None` / `Optional[X]` to `X`."""
+    type_str = type_str.strip()
+    opt = re.fullmatch(r"Optional\[(.+)\]", type_str)
+    if opt:
+        return opt.group(1).strip()
+    return re.sub(r"\s*\|\s*None$", "", type_str).strip()
+
+
+def _index_enums(code: str) -> dict[str, dict[str, str]]:
+    """Map enum class name -> {member name: raw value expression}."""
+    enums: dict[str, dict[str, str]] = {}
+    for m in _ENUM_CLASS_RE.finditer(code):
+        members = {
+            mm.group("member"): mm.group("value").strip()
+            for mm in _ENUM_MEMBER_RE.finditer(m.group("body"))
+        }
+        if members:
+            enums[m.group("name")] = members
+    return enums
+
+
+def _index_classes(code: str) -> dict[str, tuple[list[str], str]]:
+    """Map class name -> (base class names, class body)."""
+    return {
+        m.group("name"): (
+            [b.strip() for b in m.group("bases").split(",") if b.strip()],
+            m.group("body"),
+        )
+        for m in _CLASS_BLOCK_RE.finditer(code)
+    }
+
+
+def _enum_value_map(
+    members: dict[str, str], collection_enums: dict[str, dict[str, str]]
+) -> dict[str, str]:
+    """Build value -> member name, resolving `<Enum>.<member>.value` indirections."""
+    value_map: dict[str, str] = {}
+    for member, raw in members.items():
+        if raw.startswith(("(", "'", '"')) or _NUMERIC_LITERAL_RE.fullmatch(raw):
+            value = _literal_value(raw)
+        else:
+            parts = raw.split(".")
+            if len(parts) < 2:
+                continue
+            source = collection_enums.get(parts[0], {})
+            if parts[1] not in source:
+                continue
+            value = _literal_value(source[parts[1]])
+        value_map.setdefault(value, member)
+    return value_map
+
+
+def _find_inherited_field_type(
+    class_name: str, field: str, classes: dict[str, tuple[list[str], str]]
+) -> str | None:
+    """Return the type the nearest ancestor declares for *field*, if any."""
+    seen = {class_name}
+    queue = list(classes.get(class_name, ([], ""))[0])
+    while queue:
+        base = queue.pop(0)
+        if base in seen or base not in classes:
+            continue
+        seen.add(base)
+        bases, body = classes[base]
+        for fm in _FIELD_TYPE_RE.finditer(body):
+            if fm.group("name") == field:
+                return _strip_optional(fm.group("type"))
+        queue.extend(bases)
+    return None
+
+
+def fix_inherited_enum_defaults(  # noqa: C901
+    package_index,
+    package_name,
+    python_code_working_dir_root,
+    python_code_working_dir,
+    python_code_filename,
+    dependency_python_roots: list[Path] | None = None,
+) -> None:
+    """Restore enum types on fields that only override an inherited default.
+
+    A child schema may override just the ``default`` of a property it inherits via
+    ``allOf`` (e.g. a unit variant reusing the parent's ``unit_enumeration``). Such an
+    override carries no ``type``/``enum``, so the code generator infers a bare scalar
+    from the default literal and emits a field that shadows the parent's enum-typed
+    one. This resolves the ancestor's enum, maps the literal back to a member and
+    rewrites the field. Idempotent.
+    """
+    if dependency_python_roots is None:
+        dependency_python_roots = []
+
+    for subpath in ["", "v1"]:
+        work_dir = (
+            python_code_working_dir / subpath if subpath else python_code_working_dir
+        )
+        model_path = work_dir / python_code_filename
+        if not model_path.exists():
+            continue
+        content = model_path.read_text(encoding="utf-8")
+
+        classes = _index_classes(content)
+        enums = _index_enums(content)
+        collection_enums: dict[str, dict[str, str]] = {}
+        enum_module: dict[
+            str, str
+        ] = {}  # enum name -> dependency module to import from
+
+        for dep in package_index:
+            if dep == package_name:
+                continue
+            dep_python_package_name = _get_python_package_name(dep)
+            dep_module = dep_python_package_name.replace("-python", "")
+            dep_root = _find_dep_python_root(
+                dep_python_package_name,
+                python_code_working_dir_root,
+                dependency_python_roots,
+            )
+            dep_dir = dep_root / dep_python_package_name / "src"
+            for component in dep_module.split("."):
+                dep_dir /= component
+            if subpath:
+                dep_dir /= subpath
+            dep_model = dep_dir / python_code_filename
+            if not dep_model.exists():
+                continue
+            dep_code = dep_model.read_text(encoding="utf-8")
+            for name, entry in _index_classes(dep_code).items():
+                classes.setdefault(name, entry)
+            for name, members in _index_enums(dep_code).items():
+                if name not in enums:
+                    enums[name] = members
+                    enum_module[name] = dep_module
+            # unit enums reference a shared collection enum for their values
+            dep_collection = dep_dir / "_collection.py"
+            if dep_collection.exists():
+                collection_enums.update(
+                    _index_enums(dep_collection.read_text(encoding="utf-8"))
+                )
+
+        value_maps: dict[str, dict[str, str]] = {}
+        needed_imports: dict[str, set[str]] = {}
+        replacements: list[tuple[str, str]] = []
+
+        for class_name, (_bases, body) in _index_classes(content).items():
+            for fm in _SCALAR_DEFAULT_RE.finditer(body):
+                field = fm.group("name")
+                enum_name = _find_inherited_field_type(class_name, field, classes)
+                if not enum_name or enum_name not in enums:
+                    continue
+                if enum_name not in value_maps:
+                    value_maps[enum_name] = _enum_value_map(
+                        enums[enum_name], collection_enums
+                    )
+                value = _literal_value(fm.group("value"))
+                member = value_maps[enum_name].get(value)
+                if member is None:
+                    _logger.warning(
+                        f"{class_name}.{field}: default '{value}' is not a member of "
+                        f"inherited enum {enum_name} - leaving as scalar"
+                    )
+                    continue
+                replacements.append(
+                    (
+                        fm.group(0),
+                        f"{fm.group('indent')}{field}: {enum_name} | None = "
+                        f"{enum_name}.{member}",
+                    )
+                )
+                _logger.info(
+                    f"Retyped {class_name}.{field} -> {enum_name}.{member} "
+                    f"(inherited enum)"
+                )
+                if enum_name in enum_module:
+                    needed_imports.setdefault(enum_module[enum_name], set()).add(
+                        enum_name
+                    )
+
+        if not replacements:
+            continue
+        for old, new in replacements:
+            content = content.replace(old, new, 1)
+
+        import_stms = []
+        for module, names in needed_imports.items():
+            import_path = module + ("." + subpath if subpath else "")
+            for name in sorted(names):
+                stm = f"from {import_path} import {name}"
+                if stm not in content:
+                    import_stms.append(stm)
+        if import_stms:
+            block = "\n".join(import_stms) + "\n"
+            # `from __future__` must stay the first statement of the module
+            future = "from __future__ import annotations\n"
+            if future in content:
+                content = content.replace(future, future + block, 1)
+            else:
+                content = block + content
+
+        model_path.write_text(content, encoding="utf-8")
+        _logger.info(
+            f"Fixed {len(replacements)} inherited enum default(s) in {model_path}"
+        )
+
+
 def build_packages(  # noqa: C901
     packages: list[str],
     python_code_working_dir_root: Path,
@@ -1048,6 +1303,16 @@ def build_packages(  # noqa: C901
         # rewrite OSW unit enums (class <Name>Unit(Enum) with Item:OSW members) to
         # subclass UnitEnum so they register for pint conversion
         replace_unit_enums(python_code_working_dir, python_code_filename)
+
+        # restore enum types on fields whose schema only overrode the inherited default
+        fix_inherited_enum_defaults(
+            package_index,
+            package_name,
+            python_code_working_dir_root,
+            python_code_working_dir,
+            python_code_filename,
+            dependency_python_roots=effective_dep_roots,
+        )
 
         # run pre-commit hooks (formatting, linting) if available in target repo
         repo_dir = python_code_working_dir_root / python_package_name
