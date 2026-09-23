@@ -39,6 +39,13 @@ default_osw_domain = "wiki-dev.open-semantic-lab.org"
 # prompt - the build downloads schema packages from GitHub.
 osw_obj = None
 
+# Header of a class definition, capturing the comma separated base classes.
+_class_decl_pattern = re.compile(r"^class\s+\w+\s*\(([^)]*)\)\s*:")
+
+
+def _split_bases(base_list: str) -> list:
+    return [base.strip() for base in base_list.split(",") if base.strip()]
+
 
 def _get_osw(
     cred_filepath: "str | Path | None" = None,
@@ -684,6 +691,10 @@ def replace_duplicated_classes_with_imports(  # noqa: C901
                             if import_line not in content:
                                 content = import_line + "\n" + content
 
+        # Bases of classes removed by the dedup below, keyed by the class that
+        # replaces them. Used to repair self-inheritance afterwards.
+        collapsed_bases: dict[str, list] = {}
+
         # UUID-based within-package dedup (local-vs-local): a category that is
         # both generated standalone and referenced inline via $ref + custom
         # keywords yields a 2nd class with the same uuid but a different
@@ -719,6 +730,13 @@ def replace_duplicated_classes_with_imports(  # noqa: C901
                 _logger.info(
                     f"Collapsing duplicate class {name} into {canon_name} (same uuid)"
                 )
+                # Remember the bases in case the surviving class inherits from
+                # the one being removed - that would leave "class X(X)".
+                decl = _class_decl_pattern.match(body)
+                if decl:
+                    collapsed_bases.setdefault(canon_name, []).extend(
+                        b for b in _split_bases(decl.group(1)) if b != canon_name
+                    )
                 content = content.replace(body, "")
                 content = re.sub(r"\b" + re.escape(name) + r"\b", canon_name, content)
 
@@ -845,6 +863,41 @@ def replace_duplicated_classes_with_imports(  # noqa: C901
                     continue
             deduped_lines.append(line)
         content = "\n".join(deduped_lines)
+
+        # Repair self-inheritance. Collapsing a duplicate renames every
+        # reference to the surviving class, including the base class entry of
+        # a class that inherited from the duplicate - either directly or via a
+        # raw OSW ID that is resolved to a class name later on. Both leave
+        # "class X(X)", which does not import. Put the removed class's own
+        # bases back in that slot.
+        def _repair_self_base(m, known_bases=collapsed_bases):
+            name, bases = m.group(1), _split_bases(m.group(2))
+            if name not in bases:
+                return m.group(0)
+            replacement = [b for b in known_bases.get(name, []) if b != name]
+            new_bases = []
+            for base in bases:
+                for repl in [base] if base != name else replacement:
+                    if repl not in new_bases:
+                        new_bases.append(repl)
+            if not new_bases:
+                _logger.warning(
+                    f"Class {name} inherits from itself and no replacement base "
+                    f"is known - leaving it untouched"
+                )
+                return m.group(0)
+            _logger.info(
+                f"Repairing self-inheritance of {name}: "
+                f"({', '.join(bases)}) -> ({', '.join(new_bases)})"
+            )
+            return f"class {name}({', '.join(new_bases)}):"
+
+        content = re.sub(
+            r"^class\s+(\w+)\s*\(([^)]*)\)\s*:",
+            _repair_self_base,
+            content,
+            flags=re.MULTILINE,
+        )
 
         # run formatting tool black on the combined content
         # consolidate imports as well
