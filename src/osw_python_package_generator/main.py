@@ -927,9 +927,6 @@ def replace_unit_enums(python_code_working_dir, python_code_filename) -> None:
     enums, or ``<Name>Unit`` enums without unit members) keep stdlib ``Enum``.
     Applies to both pydantic versions. Idempotent.
     """
-    unit_enum_import = (
-        "from opensemantic.characteristics.quantitative._enum import UnitEnum"
-    )
     block_re = re.compile(
         r"^class (?P<name>\w+Unit)\(Enum\):.*\n(?:[ \t].*\n|\n)*",
         re.MULTILINE,
@@ -949,6 +946,14 @@ def replace_unit_enums(python_code_working_dir, python_code_filename) -> None:
         model_path = work_dir / python_code_filename
         if not model_path.exists():
             continue
+        # the v1 model has to use the v1 UnitEnum, otherwise its enum members
+        # fail the isinstance check in _static.to_unit and are handed to pint
+        # as raw OSW ids
+        unit_enum_import = (
+            "from opensemantic.characteristics.quantitative"
+            + (f".{subpath}" if subpath else "")
+            + "._enum import UnitEnum"
+        )
         text = model_path.read_text(encoding="utf-8")
         new_text = block_re.sub(repl, text)
         if new_text == text:
