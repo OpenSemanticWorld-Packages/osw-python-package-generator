@@ -47,6 +47,21 @@ def _split_bases(base_list: str) -> list:
     return [base.strip() for base in base_list.split(",") if base.strip()]
 
 
+_STRING_LITERAL_PATTERN = re.compile(r"\"[^\"]*\"|'[^']*'")
+
+
+def _sub_outside_strings(line: str, pattern, replacement: str) -> str:
+    """Apply a substitution to a line, leaving string literals untouched."""
+    parts = []
+    last = 0
+    for match in _STRING_LITERAL_PATTERN.finditer(line):
+        parts.append(pattern.sub(replacement, line[last : match.start()]))
+        parts.append(match.group(0))
+        last = match.end()
+    parts.append(pattern.sub(replacement, line[last:]))
+    return "".join(parts)
+
+
 def _get_osw(
     cred_filepath: "str | Path | None" = None,
     osw_domain: "str | None" = None,
@@ -290,6 +305,64 @@ def commit_and_tag(directory, file_paths, commit_message, tag_name):
         return False
 
 
+def _drop_property_name_titles(node, property_name: str | None = None) -> int:
+    """Drop titles that shadow the class name of a ``$ref``.
+
+    The category schema template emits ``"title": "{{{name}}}"`` for every
+    property, so a ``$ref``-ed property carries a title equal to its own name.
+    With ``use_title_as_name`` that title becomes the class name, which both
+    hides the referenced class (a property ``data`` yields ``Data`` instead of
+    the referenced row type) and collides with same-named classes of other
+    packages. A deliberately set title differs from the property name and is
+    kept, so overrides such as ``ShortName`` on ``short_name`` still produce
+    their own class.
+
+    Returns the number of titles dropped.
+    """
+    dropped = 0
+    if isinstance(node, list):
+        for item in node:
+            dropped += _drop_property_name_titles(item)
+        return dropped
+    if not isinstance(node, dict):
+        return dropped
+
+    if (
+        property_name is not None
+        and "$ref" in node
+        and node.get("title") == property_name
+    ):
+        del node["title"]
+        dropped += 1
+
+    for key, value in node.items():
+        if key == "properties" and isinstance(value, dict):
+            for name, prop in value.items():
+                dropped += _drop_property_name_titles(prop, name)
+                items = prop.get("items") if isinstance(prop, dict) else None
+                if isinstance(items, dict):
+                    dropped += _drop_property_name_titles(items, name)
+        elif key != "title":
+            dropped += _drop_property_name_titles(value)
+    return dropped
+
+
+def _sanitize_schema_titles(pages: dict[str, WtPage]) -> None:
+    """Apply :func:`_drop_property_name_titles` to every page's json schema.
+
+    Only the in-memory copy handed to the code generator is changed; the stored
+    schemas keep their titles for the wiki editor.
+    """
+    for title, page in pages.items():
+        schema = page.get_slot_content("jsonschema")
+        if not isinstance(schema, dict):
+            continue
+        dropped = _drop_property_name_titles(schema)
+        if dropped:
+            page.set_slot_content("jsonschema", schema)
+            _logger.debug(f"Dropped {dropped} property-name title(s) in {title}")
+
+
 def generate_python_dataclasses(
     schema_pages: dict[str, WtPage],
     offline_pages: dict[str, WtPage],
@@ -299,6 +372,9 @@ def generate_python_dataclasses(
     # filter schema pages
     page_list = list(schema_pages.keys())
     schema_titles = [title for title in page_list if title.startswith("Category:")]
+
+    _sanitize_schema_titles(schema_pages)
+    _sanitize_schema_titles(offline_pages)
 
     python_code_path = Path(python_code_working_dir)
     python_code_path /= python_code_filename
@@ -754,21 +830,14 @@ def replace_duplicated_classes_with_imports(  # noqa: C901
         for osw_id, class_name in osw_id_map.items():
             if osw_id in content:
                 # Only replace in type annotations (: OSW..., list[OSW...],
-                # | OSW...), not inside string literals
-                # Process line by line to skip lines containing quotes
+                # | OSW...), never inside string literals. A field can carry
+                # both, as in `tool: list[OSW...] | None = [""]`, so the
+                # string parts are skipped rather than the whole line.
+                pattern = re.compile(r"(?<![_\w])" + re.escape(osw_id) + r"(?!\w)")
                 new_lines = []
                 for line in content.splitlines(True):
-                    if (
-                        osw_id in line
-                        and '"' not in line
-                        and "'" not in line
-                        and not line.lstrip().startswith("#")
-                    ):
-                        line = re.sub(
-                            r"(?<![_\w])" + re.escape(osw_id) + r"(?!\w)",
-                            class_name,
-                            line,
-                        )
+                    if osw_id in line and not line.lstrip().startswith("#"):
+                        line = _sub_outside_strings(line, pattern, class_name)
                     new_lines.append(line)
                 content = "".join(new_lines)
                 _logger.info(f"Replaced raw OSW ID {osw_id} with {class_name}")
