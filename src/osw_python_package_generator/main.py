@@ -19,7 +19,7 @@ from osw.wtsite import WtPage, WtSite
 
 _logger = logging.getLogger(__name__)
 
-script_version = "0.4.6"
+script_version = "0.4.7"
 
 python_code_filename = "_model.py"
 
@@ -60,6 +60,26 @@ def _sub_outside_strings(line: str, pattern, replacement: str) -> str:
         last = match.end()
     parts.append(pattern.sub(replacement, line[last:]))
     return "".join(parts)
+
+
+_RAW_OSW_ID_PATTERN = re.compile(r"(?<![_\w])OSW[0-9a-f]{32}(?!\w)")
+
+
+def _find_unresolved_osw_ids(content: str) -> list:
+    """Return the lines where a raw OSW id is used as a name.
+
+    An id turns into a class name only when the owning category ships with this
+    package or with one of its python dependencies. Without that mapping the
+    annotation names something undefined. The module still parses, so the
+    problem only shows up as PydanticUndefinedAnnotation on import.
+    """
+    findings = []
+    for number, line in enumerate(content.splitlines(), start=1):
+        if line.lstrip().startswith("#"):
+            continue
+        if _RAW_OSW_ID_PATTERN.search(_STRING_LITERAL_PATTERN.sub("", line)):
+            findings.append((number, line.strip()))
+    return findings
 
 
 def _get_osw(
@@ -979,9 +999,20 @@ def replace_duplicated_classes_with_imports(  # noqa: C901
         except Exception as e:
             _logger.error(f"Formatting failed: {e}")
 
-        with open(
-            _python_code_working_dir / python_code_filename, "w", encoding="utf-8"
-        ) as file:
+        model_path = _python_code_working_dir / python_code_filename
+        unresolved = _find_unresolved_osw_ids(content)
+        if unresolved:
+            listing = "\n".join(f"  line {n}: {text}" for n, text in unresolved[:10])
+            more = (
+                f"\n  ... {len(unresolved) - 10} more" if len(unresolved) > 10 else ""
+            )
+            raise RuntimeError(
+                f"{len(unresolved)} unresolved OSW id(s) in {model_path}. The owning "
+                f"category belongs neither to this package nor to one of its python "
+                f"dependencies, so the module cannot be imported:\n{listing}{more}"
+            )
+
+        with open(model_path, "w", encoding="utf-8") as file:
             file.write(content)
 
 
