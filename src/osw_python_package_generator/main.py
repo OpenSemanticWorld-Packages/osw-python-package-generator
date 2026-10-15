@@ -329,10 +329,11 @@ def commit_and_tag(directory, file_paths, commit_message, tag_name):
 
 
 # Keywords whose subschemas still describe the property they sit under, so the
-# property name travels into them.
-_PROPERTY_SCOPED_KEYS = frozenset(
-    {"items", "oneOf", "anyOf", "allOf", "then", "else", "not", "contains"}
-)
+# property name travels into them. Only the ones that can name a type: "not"
+# says what the value must not be, and the code generator ignores the
+# conditional keywords entirely, so a title under those can never become a
+# class name.
+_PROPERTY_SCOPED_KEYS = frozenset({"items", "prefixItems", "oneOf", "anyOf", "allOf"})
 
 
 def _drop_property_name_titles(node, property_name: str | None = None) -> int:
