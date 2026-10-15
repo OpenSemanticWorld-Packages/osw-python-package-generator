@@ -47,7 +47,10 @@ def _split_bases(base_list: str) -> list:
     return [base.strip() for base in base_list.split(",") if base.strip()]
 
 
-_STRING_LITERAL_PATTERN = re.compile(r"\"[^\"]*\"|'[^']*'")
+# A string literal, with escaped quotes belonging to it: without the escape
+# arm a literal like "a \" b" ends at the escaped quote, and the rest of it is
+# treated as code and substituted into.
+_STRING_LITERAL_PATTERN = re.compile(r"\"(?:[^\"\\]|\\.)*\"|'(?:[^'\\]|\\.)*'")
 
 
 def _sub_outside_strings(line: str, pattern, replacement: str) -> str:
@@ -325,6 +328,13 @@ def commit_and_tag(directory, file_paths, commit_message, tag_name):
         return False
 
 
+# Keywords whose subschemas still describe the property they sit under, so the
+# property name travels into them.
+_PROPERTY_SCOPED_KEYS = frozenset(
+    {"items", "oneOf", "anyOf", "allOf", "then", "else", "not", "contains"}
+)
+
+
 def _drop_property_name_titles(node, property_name: str | None = None) -> int:
     """Drop titles that shadow the class name of a ``$ref``.
 
@@ -342,7 +352,7 @@ def _drop_property_name_titles(node, property_name: str | None = None) -> int:
     dropped = 0
     if isinstance(node, list):
         for item in node:
-            dropped += _drop_property_name_titles(item)
+            dropped += _drop_property_name_titles(item, property_name)
         return dropped
     if not isinstance(node, dict):
         return dropped
@@ -359,9 +369,11 @@ def _drop_property_name_titles(node, property_name: str | None = None) -> int:
         if key == "properties" and isinstance(value, dict):
             for name, prop in value.items():
                 dropped += _drop_property_name_titles(prop, name)
-                items = prop.get("items") if isinstance(prop, dict) else None
-                if isinstance(items, dict):
-                    dropped += _drop_property_name_titles(items, name)
+        elif key in _PROPERTY_SCOPED_KEYS:
+            # still the same property, so the shadowing title is still the
+            # property's own name - a $ref inside oneOf or a tuple-form items
+            # describes what that property holds
+            dropped += _drop_property_name_titles(value, property_name)
         elif key != "title":
             dropped += _drop_property_name_titles(value)
     return dropped
